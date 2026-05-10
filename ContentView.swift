@@ -17,6 +17,9 @@ struct ContentView: View {
                               format: .number.precision(.fractionLength(0...4)))
                         .multilineTextAlignment(.trailing)
                         .frame(width: 80)
+                    Text("(0.1 – 100)")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
                 }
 
                 HStack {
@@ -26,6 +29,9 @@ struct ContentView: View {
                               format: .number.precision(.fractionLength(0...4)))
                         .multilineTextAlignment(.trailing)
                         .frame(width: 80)
+                    Text("(0.1 – 100)")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
                 }
 
                 HStack {

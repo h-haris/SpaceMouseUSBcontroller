@@ -55,7 +55,11 @@ final class SpaceMouseUSBViewModel: NSObject, ObservableObject {
 
     // MARK: - Actions
 
+    static let scaleRange: ClosedRange<Float> = 0.1 ... 100.0
+
     func applyScales() {
+        rotScale   = min(max(rotScale,   Self.scaleRange.lowerBound), Self.scaleRange.upperBound)
+        transScale = min(max(transScale, Self.scaleRange.lowerBound), Self.scaleRange.upperBound)
         _ = mouse.setRotScale(rotScale)
         _ = mouse.setTransScale(transScale)
     }

@@ -54,7 +54,7 @@
 #import "SPUSBObject.h"
 #import "SPUSBdeliverQuesa.h"
 
-#define SPUSB_DEBUG 1   // set to 0 to silence raw HID logging
+#define SPUSB_DEBUG 0   // set to 1 to enable raw HID logging
 
 // 3Dconnexion USB identifiers for SpaceMouse Compact
 #define kSpaceMouse3DxVendorID  0x256F
@@ -87,11 +87,19 @@ static void hidDeviceRemovedCallback(void *context, IOReturn result,
     [(SPUSBObject *)context deviceRemoved:device];
 }
 
+static void hidReportCallback(void *context, IOReturn result, void *sender,
+                               IOHIDReportType type, uint32_t reportID,
+                               uint8_t *report, CFIndex reportLength)
+{
+    [(SPUSBObject *)context processReportID:reportID data:report length:reportLength];
+}
+
 static void hidValueCallback(void *context, IOReturn result, void *sender,
                               IOHIDValueRef value)
 {
     [(SPUSBObject *)context processValue:value];
 }
+
 
 // ---------------------------------------------------------------------------
 
@@ -166,23 +174,29 @@ static void hidValueCallback(void *context, IOReturn result, void *sender,
     hidManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
     if (!hidManager) return NO;
 
-    NSDictionary *matching = [NSDictionary dictionaryWithObjectsAndKeys:
-        [NSNumber numberWithInt:kSpaceMouse3DxVendorID], @kIOHIDVendorIDKey,
-        [NSNumber numberWithInt:kSpaceMouseCompactPID],  @kIOHIDProductIDKey,
-        nil];
-    IOHIDManagerSetDeviceMatching(hidManager, (CFDictionaryRef)matching);
+    NSDictionary *matching = @{
+        @(kIOHIDVendorIDKey):  @(kSpaceMouse3DxVendorID),
+        @(kIOHIDProductIDKey): @(kSpaceMouseCompactPID),
+    };
+    IOHIDManagerSetDeviceMatching(hidManager,
+                                  (__bridge CFDictionaryRef)matching);
 
     IOHIDManagerRegisterDeviceMatchingCallback(hidManager, hidDeviceMatchedCallback, self);
     IOHIDManagerRegisterDeviceRemovalCallback(hidManager,  hidDeviceRemovedCallback, self);
+    IOHIDManagerRegisterInputReportCallback(hidManager, hidReportCallback, self);
     IOHIDManagerRegisterInputValueCallback(hidManager, hidValueCallback, self);
 
-    IOHIDManagerScheduleWithRunLoop(hidManager, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+    IOHIDManagerScheduleWithRunLoop(hidManager,
+                                    CFRunLoopGetMain(),
+                                    kCFRunLoopDefaultMode);
 
-    IOReturn ret = IOHIDManagerOpen(hidManager, kIOHIDOptionsTypeNone);
+    // Seize the device so the SpaceMouse does not move the system cursor.
+    // Requires prior Wired Accessories approval (System Settings → Privacy & Security
+    // → Wired Accessories) on macOS 26+.
+    IOReturn ret = IOHIDManagerOpen(hidManager, kIOHIDOptionsTypeSeizeDevice);
     if (ret != kIOReturnSuccess)
     {
         NSLog(@"[SPUSB] IOHIDManagerOpen failed: 0x%08X", ret);
-        IOHIDManagerUnscheduleFromRunLoop(hidManager, CFRunLoopGetMain(), kCFRunLoopCommonModes);
         CFRelease(hidManager);
         hidManager = NULL;
         return NO;
@@ -196,18 +210,16 @@ static void hidValueCallback(void *context, IOReturn result, void *sender,
 
 - disconnectFromDevice
 {
-    if (hidDevice)
-    {
-        IOHIDDeviceUnscheduleFromRunLoop(hidDevice, CFRunLoopGetMain(), kCFRunLoopCommonModes);
-        hidDevice = NULL;
-    }
     if (hidManager)
     {
-        IOHIDManagerUnscheduleFromRunLoop(hidManager, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+        IOHIDManagerUnscheduleFromRunLoop(hidManager,
+                                         CFRunLoopGetMain(),
+                                         kCFRunLoopDefaultMode);
         IOHIDManagerClose(hidManager, kIOHIDOptionsTypeNone);
         CFRelease(hidManager);
         hidManager = NULL;
     }
+    hidDevice = NULL;
     NSLog(@"[SPUSB] disconnected");
     return self;
 }
@@ -264,18 +276,24 @@ static void hidValueCallback(void *context, IOReturn result, void *sender,
 
 - (void)deviceMatched:(IOHIDDeviceRef)device
 {
+    // Called on main runLoop.
     hidDevice = device;
-    NSLog(@"[SPUSB] device connected");
 
-    // Run the feature-report probe on a background thread.  IOHIDDeviceGetReport
-    // blocks for ~5 s per absent report; calling it here would freeze the main
-    // run loop and prevent input-report callbacks from firing.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        [self logVendorFeatureReports];
+    // Log device identity to confirm we matched the right device.
+    int32_t vid = [(__bridge NSNumber *)IOHIDDeviceGetProperty(device,
+                    CFSTR(kIOHIDVendorIDKey)) intValue];
+    int32_t pid = [(__bridge NSNumber *)IOHIDDeviceGetProperty(device,
+                    CFSTR(kIOHIDProductIDKey)) intValue];
+    NSString *name = (__bridge NSString *)IOHIDDeviceGetProperty(device,
+                    CFSTR(kIOHIDProductKey));
+    NSLog(@"[SPUSB] device connected  VID=0x%04X PID=0x%04X name=%@", vid, pid, name);
+
+    NSLog(@"[SPUSB] device callbacks ready");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:SPUSBDeviceConnectedNotification object:self];
     });
-
-    [[NSNotificationCenter defaultCenter]
-        postNotificationName:SPUSBDeviceConnectedNotification object:self];
 }
 
 - (void)deviceRemoved:(IOHIDDeviceRef)device
@@ -284,8 +302,10 @@ static void hidValueCallback(void *context, IOReturn result, void *sender,
     {
         hidDevice = NULL;
         NSLog(@"[SPUSB] device removed");
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:SPUSBDeviceDisconnectedNotification object:self];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:SPUSBDeviceDisconnectedNotification object:self];
+        });
     }
 }
 
@@ -297,39 +317,64 @@ static void hidValueCallback(void *context, IOReturn result, void *sender,
 // that Quesa's delta-move accumulation is not corrupted by stale values.
 // ---------------------------------------------------------------------------
 
-- (void)processValue:(IOHIDValueRef)value
+- (void)processReportID:(uint32_t)reportID data:(const uint8_t *)data length:(CFIndex)length
 {
-    IOHIDElementRef element = IOHIDValueGetElement(value);
-    uint32_t usagePage = IOHIDElementGetUsagePage(element);
-    uint32_t usage     = IOHIDElementGetUsage(element);
-    CFIndex  intVal    = IOHIDValueGetIntegerValue(value);
-
-#if SPUSB_DEBUG
-    NSLog(@"[SPUSB] page=0x%02X usage=0x%02X val=%ld", usagePage, usage, (long)intVal);
-#endif
-
-    // Generic Desktop (0x01) axes: X=0x30 Y=0x31 Z=0x32 Rx=0x33 Ry=0x34 Rz=0x35
-    if (usagePage == 0x01)
+    // data[0] is the report ID byte (included by the IOHIDManager report callback).
+    // Axis and button payload begins at data[1].
+    if (reportID == 1 && length >= 7)
     {
-        float v = (float)intVal;
-        switch (usage)
+        int16_t tx = (int16_t)(data[1] | ((uint16_t)data[2] << 8));
+        int16_t ty = (int16_t)(data[3] | ((uint16_t)data[4] << 8));
+        int16_t tz = (int16_t)(data[5] | ((uint16_t)data[6] << 8));
+#if SPUSB_DEBUG
+        NSLog(@"[SPUSB] T  x=%d y=%d z=%d", (int)tx, (int)ty, (int)tz);
+#endif
+        [QuesaConnection deliverTranslation:transMult*tx :transMult*ty :transMult*tz];
+    }
+    else if (reportID == 2 && length >= 7)
+    {
+        int16_t rx = (int16_t)(data[1] | ((uint16_t)data[2] << 8));
+        int16_t ry = (int16_t)(data[3] | ((uint16_t)data[4] << 8));
+        int16_t rz = (int16_t)(data[5] | ((uint16_t)data[6] << 8));
+#if SPUSB_DEBUG
+        NSLog(@"[SPUSB] R  x=%d y=%d z=%d", (int)rx, (int)ry, (int)rz);
+#endif
+        [QuesaConnection deliverRotation:rotMult*rx :rotMult*ry :rotMult*rz];
+    }
+    else if (reportID == 3)
+    {
+        if (length >= 2)
         {
-            case 0x30: [QuesaConnection deliverTranslation:transMult*v :0 :0]; break;
-            case 0x31: [QuesaConnection deliverTranslation:0 :transMult*v :0]; break;
-            case 0x32: [QuesaConnection deliverTranslation:0 :0 :transMult*v]; break;
-            case 0x33: [QuesaConnection deliverRotation:rotMult*v :0 :0]; break;
-            case 0x34: [QuesaConnection deliverRotation:0 :rotMult*v :0]; break;
-            case 0x35: [QuesaConnection deliverRotation:0 :0 :rotMult*v]; break;
-            default: break;
+            uint8_t buttons = data[1];
+            if (buttons != lastButtonState)
+            {
+#if SPUSB_DEBUG
+                NSLog(@"[SPUSB] btn 0x%02X (was 0x%02X)", buttons, lastButtonState);
+#endif
+                lastButtonState = buttons;
+                [QuesaConnection deliverKeyPress:buttons];
+            }
         }
     }
-    // Button page (0x09)
-    else if (usagePage == 0x09)
+    else
     {
-        // Re-read all buttons via the element's parent report would be ideal,
-        // but for now deliver the bitmask as reported.
-        [QuesaConnection deliverKeyPress:(int)intVal];
+#if SPUSB_DEBUG
+        NSLog(@"[SPUSB] unknown report ID=%u len=%ld", (unsigned)reportID, (long)length);
+#endif
     }
+}
+
+- (void)processValue:(IOHIDValueRef)value
+{
+#if SPUSB_DEBUG
+    IOHIDElementRef element = IOHIDValueGetElement(value);
+    NSLog(@"[SPUSB] VALUE page=0x%02X usage=0x%02X val=%ld",
+          IOHIDElementGetUsagePage(element),
+          IOHIDElementGetUsage(element),
+          (long)IOHIDValueGetIntegerValue(value));
+#else
+    (void)value;
+#endif
 }
 
 // ---------------------------------------------------------------------------

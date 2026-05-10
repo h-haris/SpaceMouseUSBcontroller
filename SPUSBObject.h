@@ -63,9 +63,10 @@
     float           rotMult;
     float           transMult;
 
-    IOHIDManagerRef hidManager;
-    IOHIDDeviceRef  hidDevice;
-    uint8_t         reportBuffer[64];
+    IOHIDManagerRef  hidManager;
+    IOHIDDeviceRef   hidDevice;
+    uint8_t          reportBuffer[64];
+    uint8_t          lastButtonState;
 
     SPUSBdeliverQuesa *QuesaConnection;
 
@@ -97,6 +98,7 @@
 // Called from C HID callbacks — do not call directly.
 - (void)deviceMatched:(IOHIDDeviceRef)device;
 - (void)deviceRemoved:(IOHIDDeviceRef)device;
+- (void)processReportID:(uint32_t)reportID data:(const uint8_t *)data length:(CFIndex)length;
 - (void)processValue:(IOHIDValueRef)value;
 
 @end

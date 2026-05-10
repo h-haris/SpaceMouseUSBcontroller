@@ -20,5 +20,7 @@
 	<string>1.0</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSInputMonitoringUsageDescription</key>
+	<string>SpaceMouseUSBcontroller needs to receive input events from the 3Dconnexion SpaceMouse.</string>
 </dict>
 </plist>
